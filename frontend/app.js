@@ -1,675 +1,737 @@
-/**
- * app.js — DataOrgModel Frontend
- *
- * Two-phase processing:
- *   1. Upload → /api/analyze → Mapping Review
- *   2. Confirm → /api/confirm → Results (with quality, anomalies, timeline)
- *
- * Plus: template save/load, interactive timeline canvas
- */
+/* ═══════════════════════════════════════════════════════════════
+   app.js — Pareto Contract Data Merger
+   3-step flow: Upload → Map & Select → Master Sheet + Append
+   ═══════════════════════════════════════════════════════════════ */
 
-// ── DOM refs ─────────────────────────────────────────────────────
-const $ = id => document.getElementById(id);
+'use strict';
 
-const dropZone = $('drop-zone');
-const fileInput = $('file-input');
-const vendorSlider = $('vendor-threshold');
-const headerSlider = $('header-threshold');
-const vendorVal = $('vendor-val');
-const headerVal = $('header-val');
+// ── State ───────────────────────────────────────────────────────
+let uploadData = null;       // POST /api/upload response
+let masterData = null;       // POST /api/merge response
+let appendUploadData = null; // POST /api/append/upload response
+let selectedSheets = new Set();
+let appendSelectedSheets = new Set();
+let jobId = null;
 
-const uploadSection = $('upload-section');
-const analyzingSection = $('analyzing-section');
-const mappingSection = $('mapping-section');
-const processSection = $('processing-section');
-const resultsSection = $('results-section');
+// ── DOM refs ────────────────────────────────────────────────────
+const $ = (id) => document.getElementById(id);
+const sections = ['s-upload', 's-loading', 's-mapping', 's-master'];
 
-const analyzeStatus = $('analyze-status');
-const analyzeProgress = $('analyze-progress');
-const processStatus = $('process-status');
-const progressFill = $('progress-fill');
+// ── Utilities ───────────────────────────────────────────────────
+const esc = (s) => {
+    const d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+};
+const trunc = (s, n) => (s && s.length > n ? s.slice(0, n) + '…' : s || '');
+const fmt = (n) => (n == null ? '—' : typeof n === 'number' ? n.toLocaleString() : String(n));
 
-const mappingTbody = $('mapping-tbody');
-const matchedCount = $('matched-count');
-const llmCount = $('llm-count');
-const unmappedCount = $('unmapped-count');
-const confirmBtn = $('confirm-mappings-btn');
-const resetMappingsBtn = $('reset-mappings-btn');
-const saveTemplateBtn = $('save-template-btn');
+// ── Section management ──────────────────────────────────────────
+function showSection(id) {
+    sections.forEach((s) => $(s).classList.toggle('hidden', s !== id));
+}
 
-const auditGrid = $('audit-grid');
-const vendorClusters = $('vendor-clusters');
-const unmappedList = $('unmapped-list');
-const unmappedWrapper = $('unmapped-wrapper');
-const previewCount = $('preview-count');
-const previewThead = $('preview-thead');
-const previewTbody = $('preview-tbody');
-const downloadXlsxBtn = $('download-xlsx-btn');
-const downloadCsvBtn = $('download-csv-btn');
-const resetBtn = $('reset-btn');
+function setStep(n) {
+    document.querySelectorAll('.step').forEach((el) => {
+        const s = parseInt(el.dataset.s);
+        el.classList.toggle('active', s === n);
+        el.classList.toggle('done', s < n);
+    });
+}
 
-const templateBar = $('template-bar');
-const templateChips = $('template-chips');
+// ── Upload ──────────────────────────────────────────────────────
+function initUpload() {
+    const zone = $('drop-zone');
+    const input = $('file-input');
 
-let currentResult = null;
-let analyzeData = null;
-let originalMappings = null;
+    zone.addEventListener('click', () => input.click());
+    zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    zone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        if (e.dataTransfer.files.length) doUpload(e.dataTransfer.files[0]);
+    });
+    input.addEventListener('change', () => { if (input.files.length) doUpload(input.files[0]); });
+}
 
-// ── Slider updates ───────────────────────────────────────────────
-vendorSlider.addEventListener('input', () => vendorVal.textContent = vendorSlider.value + '%');
-headerSlider.addEventListener('input', () => headerVal.textContent = headerSlider.value + '%');
+async function doUpload(file) {
+    showSection('s-loading');
+    setStep(1);
 
-// ── Templates — load on page init ────────────────────────────────
-async function loadTemplates() {
+    const status = $('loading-status');
+    const bar = $('loading-progress');
+    status.textContent = `Analyzing ${file.name}…`;
+    bar.style.width = '30%';
+
+    const fd = new FormData();
+    fd.append('file', file);
+
     try {
-        const resp = await fetch('/api/templates');
-        const data = await resp.json();
-        if (data.templates && data.templates.length > 0) {
-            templateBar.classList.remove('hidden');
-            templateChips.innerHTML = '';
-            data.templates.forEach(t => {
-                const chip = document.createElement('button');
-                chip.className = 'template-chip';
-                chip.innerHTML = `<span>${esc(t.name)}</span><small>${t.column_count} cols</small>`;
-                chip.addEventListener('click', () => applyTemplate(t.id));
-                templateChips.appendChild(chip);
-            });
-        } else {
-            templateBar.classList.add('hidden');
+        bar.style.width = '60%';
+        const resp = await fetch('/api/upload', { method: 'POST', body: fd });
+        bar.style.width = '90%';
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            status.textContent = `Error: ${err.detail || 'Upload failed'}`;
+            bar.style.background = 'var(--red)';
+            return;
         }
-    } catch (e) {
-        /* ignore */
+
+        uploadData = await resp.json();
+        jobId = uploadData.job_id;
+        bar.style.width = '100%';
+
+        setTimeout(() => {
+            setStep(2);
+            showSection('s-mapping');
+            renderSheetSummary();
+            buildMappingTable();
+        }, 400);
+    } catch (err) {
+        status.textContent = `Failed: ${err.message}`;
     }
 }
 
-async function applyTemplate(templateId) {
-    if (!analyzeData) return;
-    try {
-        const resp = await fetch(`/api/templates/${templateId}`);
-        const template = await resp.json();
-        const savedMappings = template.mappings || {};
+// ── Sheet Summary Chips ─────────────────────────────────────────
+function renderSheetSummary() {
+    const wrap = $('sheet-summary');
+    selectedSheets = new Set();
+    if (uploadData.sheets) {
+        uploadData.sheets.forEach((s) => selectedSheets.add(s.sheet_name));
+    }
+    _rebuildSheetChips(wrap, uploadData.sheets, selectedSheets, false);
+}
 
-        // Apply template mappings to current analyze data
-        analyzeData.mappings.forEach(m => {
-            if (savedMappings[m.original]) {
-                m.canonical = savedMappings[m.original];
-                m.confidence = 'high';
-                m.source = 'template';
+function _rebuildSheetChips(wrap, sheets, selected, isAppend) {
+    if (!wrap) return;
+    const total = (sheets || []).length;
+    let html = '';
+
+    if (total > 1) {
+        const prefix = isAppend ? 'append-' : '';
+        html += `<div class="sheet-select-actions">
+            <span class="sheet-select-label">Select sheets to include:</span>
+            <button class="sheet-select-link" data-action="${prefix}select-all">Select All</button>
+            <span class="sheet-select-sep">·</span>
+            <button class="sheet-select-link" data-action="${prefix}deselect-all">Deselect All</button>
+        </div>`;
+    }
+
+    html += '<div class="sheet-chips-row">';
+    (sheets || []).forEach((s) => {
+        const isSelected = selected.has(s.sheet_name);
+        const cls = isSelected ? 'selected' : 'deselected';
+        const check = isSelected ? '✓' : '';
+        const dataAttr = isAppend ? 'data-append-sheet' : 'data-sheet';
+        html += `<div class="sheet-chip ${cls}" ${dataAttr}="${esc(s.sheet_name)}" title="Click to ${isSelected ? 'exclude' : 'include'}">
+            <span class="sheet-check">${check}</span>
+            ${esc(s.sheet_name)}
+            <span class="muted">${fmt(s.row_count)} rows · ${fmt(s.column_count)} cols</span>
+        </div>`;
+    });
+    html += '</div>';
+    wrap.innerHTML = html;
+
+    // Attach listeners
+    _initChipListeners(wrap, sheets, selected, isAppend);
+}
+
+function _initChipListeners(wrap, sheets, selected, isAppend) {
+    const chipSelector = isAppend ? '[data-append-sheet]' : '[data-sheet]';
+    const dataKey = isAppend ? 'appendSheet' : 'sheet';
+
+    wrap.querySelectorAll(chipSelector).forEach((chip) => {
+        chip.onclick = () => {
+            const name = chip.dataset[dataKey];
+            if (selected.has(name)) selected.delete(name);
+            else selected.add(name);
+            _rebuildSheetChips(wrap, sheets, selected, isAppend);
+            if (!isAppend) buildMappingTable();
+            else buildAppendMappingTable();
+        };
+    });
+
+    wrap.querySelectorAll('[data-action]').forEach((btn) => {
+        btn.onclick = () => {
+            const action = btn.dataset.action;
+            if (action.includes('select-all')) {
+                sheets.forEach((s) => selected.add(s.sheet_name));
+            } else {
+                selected.clear();
+            }
+            _rebuildSheetChips(wrap, sheets, selected, isAppend);
+            if (!isAppend) buildMappingTable();
+            else buildAppendMappingTable();
+        };
+    });
+}
+
+// ── Mapping Table ───────────────────────────────────────────────
+
+// The target field options for the dropdown (dynamically built from columns)
+function getTargetOptions(existingMasterCols) {
+    // Build a set of unique column names from the current upload
+    const uniqueCols = new Set();
+    (uploadData?.sheets || []).forEach((s) => {
+        s.columns.forEach((c) => uniqueCols.add(c));
+    });
+
+    // If we have existing master columns, include those too
+    if (existingMasterCols) {
+        existingMasterCols.forEach((c) => uniqueCols.add(c));
+    }
+
+    // Key columns always available
+    const keyOpts = ['account_id', 'close_date'];
+    const allCols = [...keyOpts];
+
+    // Add unique cols that aren't already key opts
+    uniqueCols.forEach((c) => {
+        const lower = c.toLowerCase().trim();
+        if (!keyOpts.includes(lower)) {
+            allCols.push(c);
+        }
+    });
+
+    return allCols;
+}
+
+function buildMappingTable() {
+    const tbody = $('mapping-tbody');
+    const sheets = (uploadData?.sheets || []).filter((s) => selectedSheets.has(s.sheet_name));
+
+    // Collect unique columns from selected sheets + samples
+    const sampleMap = {};
+    const colSet = new Set();
+    sheets.forEach((s) => {
+        s.columns.forEach((c) => {
+            colSet.add(c);
+            if (!sampleMap[c] && s.sample_values[c]) {
+                sampleMap[c] = s.sample_values[c];
             }
         });
+    });
 
-        renderMappingReview(analyzeData);
-    } catch (e) {
-        /* ignore */
+    const allCols = [...colSet];
+    const targetOptions = getTargetOptions(null);
+
+    const optionsHtml = `<option value="">— skip —</option>` +
+        targetOptions.map((f) => {
+            const isKey = f === 'account_id' || f === 'close_date';
+            return `<option value="${esc(f)}">${esc(f)}${isKey ? ' ★' : ''}</option>`;
+        }).join('');
+
+    let rows = '';
+    if (allCols.length === 0) {
+        rows = `<tr><td colspan="3" style="text-align:center;padding:24px;color:var(--text-sec)">No sheets selected</td></tr>`;
+    }
+
+    for (const rawCol of allCols) {
+        const samples = (sampleMap[rawCol] || []).slice(0, 6);
+        let samplesHtml = '<span class="muted">—</span>';
+        if (samples.length) {
+            samplesHtml = `<div class="samples-wrap">${samples.map((s) =>
+                `<span class="sample-pill">${esc(trunc(String(s), 36))}</span>`
+            ).join('')}</div>`;
+        }
+
+        rows += `<tr>
+            <td class="col-name">${esc(rawCol)}</td>
+            <td>${samplesHtml}</td>
+            <td><select class="mapping-select" data-raw="${esc(rawCol)}">${optionsHtml}</select></td>
+        </tr>`;
+    }
+
+    tbody.innerHTML = rows;
+
+    // Auto-detect: try to pre-select mappings
+    document.querySelectorAll('#mapping-tbody .mapping-select').forEach((sel) => {
+        const raw = sel.dataset.raw.toLowerCase().trim();
+        // Try to auto-map account_id
+        if (raw.includes('account') && raw.includes('id') || raw === 'accountid' || raw === 'account_id') {
+            sel.value = 'account_id';
+        }
+        // Try to auto-map close_date
+        else if (raw.includes('close') && raw.includes('date') || raw === 'closedate' || raw === 'close_date') {
+            sel.value = 'close_date';
+        }
+        // Self-map other columns by default
+        else {
+            // Check if the raw column name exists in target options
+            const exactMatch = targetOptions.find((t) => t === sel.dataset.raw);
+            if (exactMatch) {
+                sel.value = exactMatch;
+            }
+        }
+        sel.addEventListener('change', updateMappingCounts);
+    });
+
+    updateMappingCounts();
+}
+
+function updateMappingCounts() {
+    const selects = document.querySelectorAll('#mapping-tbody .mapping-select');
+    let mapped = 0, skipped = 0;
+    let hasAccountId = false, hasCloseDate = false;
+
+    selects.forEach((s) => {
+        if (s.value) {
+            mapped++;
+            if (s.value === 'account_id') hasAccountId = true;
+            if (s.value === 'close_date') hasCloseDate = true;
+
+            // Visual feedback for key column mapping
+            s.classList.toggle('required-mapped', s.value === 'account_id' || s.value === 'close_date');
+            s.classList.remove('required-missing');
+        } else {
+            skipped++;
+            s.classList.remove('required-mapped', 'required-missing');
+        }
+    });
+
+    $('matched-count').textContent = `${mapped} mapped`;
+    $('unmapped-count').textContent = `${skipped} skipped`;
+
+    // Enable/disable merge button based on required fields
+    const mergeBtn = $('merge-btn');
+    if (hasAccountId && hasCloseDate) {
+        mergeBtn.disabled = false;
+        mergeBtn.title = '';
+    } else {
+        mergeBtn.disabled = true;
+        const missing = [];
+        if (!hasAccountId) missing.push('account_id');
+        if (!hasCloseDate) missing.push('close_date');
+        mergeBtn.title = `Map these required columns first: ${missing.join(', ')}`;
     }
 }
 
-saveTemplateBtn.addEventListener('click', async () => {
-    const name = prompt('Template name:');
-    if (!name) return;
+// ── Merge ───────────────────────────────────────────────────────
+async function doMerge() {
+    showSection('s-loading');
+    const status = $('loading-status');
+    const bar = $('loading-progress');
+    status.textContent = 'Merging sheets…';
+    bar.style.width = '30%';
+    bar.style.background = '';
 
-    const selects = mappingTbody.querySelectorAll('.mapping-select');
+    // Gather mappings
     const mappings = {};
-    selects.forEach(sel => {
-        if (sel.value) mappings[sel.dataset.original] = sel.value;
+    document.querySelectorAll('#mapping-tbody .mapping-select').forEach((sel) => {
+        mappings[sel.dataset.raw] = sel.value || null;
     });
 
     try {
-        await fetch('/api/templates/save', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, mappings }),
-        });
-        loadTemplates();
-    } catch (e) {
-        /* ignore */
-    }
-});
-
-loadTemplates();
-
-// ── Drag & drop ──────────────────────────────────────────────────
-dropZone.addEventListener('click', () => fileInput.click());
-dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
-dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
-dropZone.addEventListener('drop', e => {
-    e.preventDefault();
-    dropZone.classList.remove('dragover');
-    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
-});
-fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
-
-// ── Phase 1: Analyze ─────────────────────────────────────────────
-async function handleFile(file) {
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (!['xlsx', 'csv'].includes(ext)) { alert('Please upload .xlsx or .csv'); return; }
-
-    showSection('analyzing');
-    setAnalyzeProgress(0);
-    setAnalyzeStatus('Uploading file…');
-
-    const formData = new FormData();
-    formData.append('file', file);
-    const params = new URLSearchParams({ header_threshold: headerSlider.value });
-
-    try {
-        setAnalyzeProgress(15);
-        const resp = await fetch(`/api/analyze?${params}`, { method: 'POST', body: formData });
-        setAnalyzeProgress(60);
-        setAnalyzeStatus('Analyzing columns…');
-
-        if (!resp.ok) { const err = await resp.json(); throw new Error(err.detail || 'Failed'); }
-
-        setAnalyzeProgress(90);
-        setAnalyzeStatus('Building review…');
-
-        analyzeData = await resp.json();
-        originalMappings = JSON.parse(JSON.stringify(analyzeData.mappings));
-
-        setAnalyzeProgress(100);
-        setTimeout(() => renderMappingReview(analyzeData), 350);
-
-    } catch (err) {
-        alert('Error: ' + err.message);
-        showSection('upload');
-    }
-}
-
-// ── Mapping Review ───────────────────────────────────────────────
-function renderMappingReview(data) {
-    showSection('mapping');
-
-    const mappings = data.mappings;
-    const categories = data.categories || [];
-
-    let matched = 0, llm = 0, unmatched = 0;
-    mappings.forEach(m => {
-        if (m.source === 'llm') llm++;
-        else if (m.canonical && m.source !== 'unmapped') matched++;
-        else unmatched++;
-    });
-    matchedCount.textContent = `${matched} matched`;
-    llmCount.textContent = `${llm} by AI`;
-    unmappedCount.textContent = `${unmatched} unmapped`;
-
-    mappingTbody.innerHTML = '';
-
-    const sorted = [...mappings].sort((a, b) => {
-        const order = { unmapped: 0, llm: 1, passthrough: 2, template: 2, fuzzy: 3, exact: 4 };
-        return (order[a.source] ?? 3) - (order[b.source] ?? 3);
-    });
-
-    sorted.forEach(m => {
-        const tr = document.createElement('tr');
-        tr.dataset.original = m.original;
-
-        let confClass = 'conf-none';
-        if (m.confidence === 'high') confClass = 'conf-high';
-        else if (m.confidence === 'medium') confClass = 'conf-medium';
-        tr.className = confClass;
-
-        // Col: Original name
-        const tdOrig = document.createElement('td');
-        tdOrig.className = 'col-original';
-        tdOrig.innerHTML = `<span class="col-name">${esc(m.original)}</span>`;
-        tr.appendChild(tdOrig);
-
-        // Col: Sample values
-        const tdSamples = document.createElement('td');
-        tdSamples.className = 'col-samples';
-        const samples = (m.samples || []).slice(0, 3);
-        tdSamples.innerHTML = samples.length
-            ? samples.map(s => `<span class="sample-pill">${esc(trunc(String(s), 22))}</span>`).join('')
-            : '<span class="no-samples">—</span>';
-        tr.appendChild(tdSamples);
-
-        // Col: Dropdown
-        const tdMapped = document.createElement('td');
-        tdMapped.className = 'col-mapped';
-        const select = document.createElement('select');
-        select.className = 'mapping-select';
-        select.dataset.original = m.original;
-
-        const opts = [
-            { value: '', text: '— Not mapped —' },
-            { value: m.original, text: `Keep "${trunc(m.original, 28)}"` },
-            { value: '---', text: '─────────────', disabled: true },
-        ];
-        categories.forEach(c => opts.push({ value: c, text: c }));
-        opts.forEach(o => {
-            const opt = document.createElement('option');
-            opt.value = o.value || '';
-            opt.textContent = o.text;
-            if (o.disabled) opt.disabled = true;
-            select.appendChild(opt);
-        });
-
-        select.value = m.canonical || m.original;
-        select.addEventListener('change', updateMappingStats);
-        tdMapped.appendChild(select);
-        tr.appendChild(tdMapped);
-
-        // Col: Confidence
-        const tdConf = document.createElement('td');
-        tdConf.className = 'col-confidence';
-        const confLabel = m.confidence === 'none' ? 'unmatched' : m.confidence;
-        tdConf.innerHTML = `<span class="conf-badge ${confClass}">${confLabel}</span>`;
-        tr.appendChild(tdConf);
-
-        // Col: Source
-        const tdSource = document.createElement('td');
-        tdSource.className = 'col-source';
-        const sourceLabels = { exact: 'Exact', fuzzy: 'Fuzzy', llm: 'AI', unmapped: '—', passthrough: 'Auto', template: 'Template' };
-        tdSource.innerHTML = `<span class="source-label source-${m.source}">${sourceLabels[m.source] || m.source}</span>`;
-        tr.appendChild(tdSource);
-
-        mappingTbody.appendChild(tr);
-    });
-}
-
-function updateMappingStats() {
-    const selects = mappingTbody.querySelectorAll('.mapping-select');
-    let matched = 0, unmatched = 0;
-    selects.forEach(sel => {
-        if (sel.value && sel.value !== sel.dataset.original) matched++;
-        else if (!sel.value) unmatched++;
-    });
-    matchedCount.textContent = `${matched} matched`;
-    unmappedCount.textContent = `${unmatched} unmapped`;
-}
-
-// ── Confirm & process ────────────────────────────────────────────
-confirmBtn.addEventListener('click', async () => {
-    if (!analyzeData) return;
-    showSection('processing');
-    setProgress(0);
-    setStatus('Preparing mappings…');
-
-    const selects = mappingTbody.querySelectorAll('.mapping-select');
-    const mappings = {};
-    selects.forEach(sel => { mappings[sel.dataset.original] = sel.value || null; });
-
-    try {
-        setProgress(20);
-        setStatus('Running pipeline…');
-        const resp = await fetch('/api/confirm', {
+        bar.style.width = '60%';
+        const resp = await fetch('/api/merge', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                job_id: analyzeData.job_id,
-                mappings,
-                vendor_threshold: parseInt(vendorSlider.value),
-                header_threshold: parseInt(headerSlider.value),
+                job_id: jobId,
+                selected_sheets: [...selectedSheets],
+                mappings: mappings,
             }),
         });
 
-        setProgress(70);
-        setStatus('Building results…');
-        if (!resp.ok) { const err = await resp.json(); throw new Error(err.detail || 'Failed'); }
+        bar.style.width = '90%';
 
-        setProgress(90);
-        const data = await resp.json();
-        currentResult = data;
-
-        setProgress(100);
-        setStatus('Done!');
-        setTimeout(() => renderResults(data), 400);
-
-    } catch (err) {
-        alert('Error: ' + err.message);
-        showSection('mapping');
-    }
-});
-
-resetMappingsBtn.addEventListener('click', () => {
-    if (originalMappings && analyzeData) {
-        analyzeData.mappings = JSON.parse(JSON.stringify(originalMappings));
-        renderMappingReview(analyzeData);
-    }
-});
-
-// ── Section switching ────────────────────────────────────────────
-function showSection(which) {
-    uploadSection.classList.toggle('hidden', which !== 'upload');
-    analyzingSection.classList.toggle('hidden', which !== 'analyzing');
-    mappingSection.classList.toggle('hidden', which !== 'mapping');
-    processSection.classList.toggle('hidden', which !== 'processing');
-    resultsSection.classList.toggle('hidden', which !== 'results');
-}
-
-// ── Tab navigation ───────────────────────────────────────────────
-document.querySelectorAll('.result-tabs .tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-        document.querySelectorAll('.result-tabs .tab').forEach(t => t.classList.remove('active'));
-        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-        tab.classList.add('active');
-        $('panel-' + tab.dataset.tab).classList.add('active');
-
-        if (tab.dataset.tab === 'timeline' && currentResult) {
-            requestAnimationFrame(() => drawTimeline(currentResult.timeline));
+        if (!resp.ok) {
+            const err = await resp.json();
+            if (resp.status === 409) {
+                // Conflict error
+                showSection('s-mapping');
+                setStep(2);
+                showError(err.detail);
+                return;
+            }
+            status.textContent = `Error: ${err.detail || 'Merge failed'}`;
+            bar.style.background = 'var(--red)';
+            return;
         }
-    });
-});
 
-// ── Render results ───────────────────────────────────────────────
-function renderResults(data) {
-    showSection('results');
-    const a = data.audit;
+        masterData = await resp.json();
+        bar.style.width = '100%';
 
-    // Audit cards
-    auditGrid.innerHTML = '';
-    const cards = [
-        { value: a.total_rows_ingested, label: 'Rows Ingested', icon: '📥', cls: 'accent' },
-        { value: a.tabs_processed, label: 'Tabs Processed', icon: '📑', cls: 'purple' },
-        { value: a.final_rows, label: 'Final Rows', icon: '✅', cls: 'success' },
-        { value: a.unique_vendors, label: 'Unique Vendors', icon: '🏢', cls: 'pink' },
-        { value: a.quote_lines_merged, label: 'Lines Merged', icon: '🔗', cls: 'warning' },
-        { value: a.duplicates_removed, label: 'Dupes Removed', icon: '🗑', cls: 'accent' },
-        { value: a.anomalies_flagged || 0, label: 'Anomalies', icon: '⚠️', cls: 'danger' },
-    ];
-    cards.forEach((c, i) => {
-        const el = document.createElement('div');
-        el.className = `audit-card ${c.cls}`;
-        el.style.animationDelay = `${i * 0.05}s`;
-        el.innerHTML = `
-            <div class="card-icon">${c.icon}</div>
-            <div class="value">${c.value.toLocaleString()}</div>
-            <div class="label">${c.label}</div>`;
-        auditGrid.appendChild(el);
-    });
-
-    // Data preview
-    previewCount.textContent = `${data.preview.length} of ${a.final_rows}`;
-    const cols = a.columns.filter(c => c !== '_anomaly_flags');
-    renderTable(cols, data.preview);
-
-    // Data quality
-    renderQuality(data.quality);
-
-    // Anomalies
-    renderAnomalies(data.anomalies);
-
-    // Vendor clusters
-    renderClusters(data.vendor_clusters, a);
-
-    // Timeline (defer until tab is viewed)
+        setTimeout(() => {
+            setStep(3);
+            showSection('s-master');
+            renderMaster();
+        }, 400);
+    } catch (err) {
+        status.textContent = `Failed: ${err.message}`;
+    }
 }
 
-// ── Data Preview Table ───────────────────────────────────────────
-function renderTable(columns, rows) {
-    previewThead.innerHTML = '<tr>' + columns.map(c => `<th>${esc(c)}</th>`).join('') + '</tr>';
-    previewTbody.innerHTML = rows.map(row => {
-        const flags = row._anomaly_flags || '';
-        const cls = flags ? ' class="flagged-row"' : '';
-        return `<tr${cls}>` + columns.map(c => `<td>${esc(String(row[c] ?? ''))}</td>`).join('') + '</tr>';
+// ── Master Sheet ────────────────────────────────────────────────
+function renderMaster() {
+    const data = masterData;
+    const summary = data.summary || {};
+
+    // Banner
+    $('banner-icon').textContent = '✅';
+    $('banner-title').textContent = 'Master Sheet Ready';
+    $('banner-sub').textContent = `${fmt(summary.row_count)} rows · ${fmt(summary.column_count)} columns · ${data.sheets_merged || '?'} sheets merged`;
+
+    // KPIs
+    const kpis = [
+        { val: fmt(summary.row_count), label: 'Total Rows' },
+        { val: fmt(summary.column_count), label: 'Columns' },
+        { val: data.sheets_merged || '—', label: 'Sheets Merged' },
+    ];
+
+    // Key coverage
+    const keyCov = summary.key_coverage || {};
+    for (const k of ['account_id', 'close_date']) {
+        if (keyCov[k]) {
+            kpis.push({ val: `${keyCov[k].pct}%`, label: `${k} Fill` });
+        }
+    }
+
+    $('kpi-grid').innerHTML = kpis.map((k) =>
+        `<div class="kpi"><div class="kpi-val">${k.val}</div><div class="kpi-label">${k.label}</div></div>`
+    ).join('');
+
+    renderDataPreview(data);
+    renderQuality(data);
+    setupDownloads();
+}
+
+function renderDataPreview(data) {
+    const cols = data.columns || [];
+    const rows = data.preview || [];
+    const total = data.summary?.row_count ?? rows.length;
+
+    $('preview-count').textContent = total === 0
+        ? 'No rows in output'
+        : `Showing ${rows.length} of ${fmt(total)} rows`;
+
+    if (cols.length === 0) {
+        $('data-thead').innerHTML = '<tr><th>—</th></tr>';
+        $('data-tbody').innerHTML = '<tr><td class="muted">No columns</td></tr>';
+        return;
+    }
+
+    $('data-thead').innerHTML = `<tr>${cols.map((c) => {
+        const isKey = c === 'account_id' || c === 'close_date';
+        return `<th>${esc(c)}${isKey ? ' ★' : ''}</th>`;
+    }).join('')}</tr>`;
+
+    $('data-tbody').innerHTML = rows.length === 0
+        ? `<tr><td colspan="${cols.length}" class="muted" style="text-align:center;padding:24px">No preview rows</td></tr>`
+        : rows.map((row) =>
+            `<tr>${cols.map((c) => `<td title="${esc(fmt(row[c]))}">${esc(trunc(fmt(row[c]), 40))}</td>`).join('')}</tr>`
+        ).join('');
+}
+
+function renderQuality(data) {
+    const ringEl = $('quality-ring');
+    const barsEl = $('quality-bars');
+    if (!ringEl || !barsEl) return;
+
+    const cols = data.columns || [];
+    const rows = data.preview || [];
+
+    if (cols.length === 0 || rows.length === 0) {
+        ringEl.innerHTML = '<p class="muted" style="padding:24px;text-align:center">No quality data</p>';
+        barsEl.innerHTML = '';
+        return;
+    }
+
+    // Compute completeness per column
+    const colStats = {};
+    let totalCompleteness = 0;
+
+    cols.forEach((col) => {
+        let nonNull = 0;
+        rows.forEach((row) => {
+            if (row[col] !== null && row[col] !== undefined && row[col] !== '') nonNull++;
+        });
+        const pct = Math.round((nonNull / rows.length) * 100);
+        colStats[col] = pct;
+        totalCompleteness += pct;
+    });
+
+    const overall = Math.round(totalCompleteness / cols.length);
+
+    // Ring
+    const color = overall >= 80 ? 'var(--green)' : overall >= 50 ? 'var(--amber)' : 'var(--red)';
+    const circum = 2 * Math.PI * 58;
+    const offset = circum - (overall / 100) * circum;
+
+    ringEl.innerHTML = `
+        <svg width="148" height="148" viewBox="0 0 148 148">
+            <circle cx="74" cy="74" r="58" fill="none" stroke="var(--border)" stroke-width="5"/>
+            <circle cx="74" cy="74" r="58" fill="none" stroke="${color}" stroke-width="5"
+                stroke-dasharray="${circum}" stroke-dashoffset="${offset}"
+                stroke-linecap="round" transform="rotate(-90 74 74)"
+                style="transition: stroke-dashoffset 1s ease"/>
+            <text x="74" y="70" text-anchor="middle" fill="${color}" font-size="28" font-weight="800">${overall}%</text>
+            <text x="74" y="90" text-anchor="middle" fill="var(--text-sec)" font-size="10">COMPLETENESS</text>
+        </svg>
+    `;
+
+    // Bars
+    const entries = Object.entries(colStats).sort((a, b) => a[1] - b[1]);
+    barsEl.innerHTML = entries.map(([col, pct]) => {
+        const cls = pct >= 80 ? '' : pct >= 50 ? ' mid' : ' low';
+        return `<div class="q-bar-row">
+            <span class="q-bar-label" title="${esc(col)}">${esc(col)}</span>
+            <div class="q-bar-track"><div class="q-bar-fill${cls}" style="width:${pct}%"></div></div>
+            <span class="q-bar-pct">${pct}%</span>
+        </div>`;
     }).join('');
 }
 
-// ── Data Quality Dashboard ───────────────────────────────────────
-function renderQuality(q) {
-    if (!q) return;
-    const overview = $('quality-overview');
-    const bars = $('quality-bars');
-
-    // Score ring
-    const scoreColor = q.overall_score >= 80 ? '#22c55e' : q.overall_score >= 50 ? '#f59e0b' : '#ef4444';
-    overview.innerHTML = `
-        <div class="quality-score-card">
-            <div class="score-ring" style="--score:${q.overall_score};--color:${scoreColor}">
-                <svg viewBox="0 0 120 120">
-                    <circle cx="60" cy="60" r="52" fill="none" stroke="rgba(255,255,255,0.06)" stroke-width="8"/>
-                    <circle cx="60" cy="60" r="52" fill="none" stroke="${scoreColor}" stroke-width="8"
-                        stroke-dasharray="${q.overall_score * 3.267} 326.7"
-                        stroke-linecap="round" transform="rotate(-90 60 60)"
-                        class="score-arc"/>
-                </svg>
-                <div class="score-number">${q.overall_score}%</div>
-            </div>
-            <div class="score-meta">
-                <h3>Overall Quality</h3>
-                <p>${q.total_rows.toLocaleString()} rows · ${q.total_columns} columns</p>
-            </div>
-        </div>
-    `;
-
-    // Column bars
-    bars.innerHTML = '';
-    (q.columns || []).forEach(col => {
-        const barColor = col.rating === 'excellent' ? '#22c55e' : col.rating === 'fair' ? '#f59e0b' : '#ef4444';
-        const div = document.createElement('div');
-        div.className = 'quality-bar-item';
-        div.innerHTML = `
-            <div class="qb-header">
-                <span class="qb-name">${esc(col.name)}</span>
-                <span class="qb-pct" style="color:${barColor}">${col.completeness}%</span>
-            </div>
-            <div class="qb-track">
-                <div class="qb-fill" style="width:${col.completeness}%;background:${barColor}"></div>
-            </div>
-        `;
-        bars.appendChild(div);
-    });
+// ── Downloads ───────────────────────────────────────────────────
+function setupDownloads() {
+    $('dl-csv').onclick = () => {
+        if (jobId) window.location.href = `/api/download/${jobId}?format=csv`;
+    };
+    $('dl-xlsx').onclick = () => {
+        if (jobId) window.location.href = `/api/download/${jobId}?format=xlsx`;
+    };
 }
 
-// ── Anomalies ────────────────────────────────────────────────────
-function renderAnomalies(anomalies) {
-    const container = $('anomaly-content');
-    if (!anomalies || anomalies.length === 0) {
-        container.innerHTML = `
-            <div class="empty-state success-state">
-                <div class="empty-icon">✅</div>
-                <h3>No Anomalies Detected</h3>
-                <p>Your data looks clean — no suspicious patterns found.</p>
-            </div>`;
-        return;
-    }
+// ── Append Flow ─────────────────────────────────────────────────
+function initAppend() {
+    const zone = $('append-zone');
+    const input = $('append-input');
 
-    container.innerHTML = `
-        <div class="anomaly-grid">
-            ${anomalies.map(a => {
-        const sevClass = a.severity === 'high' ? 'sev-high' : a.severity === 'medium' ? 'sev-medium' : 'sev-low';
-        const sevIcon = a.severity === 'high' ? '🔴' : a.severity === 'medium' ? '🟡' : '🔵';
-        return `
-                    <div class="anomaly-card ${sevClass}">
-                        <div class="anomaly-header">
-                            <span class="anomaly-icon">${sevIcon}</span>
-                            <span class="anomaly-type">${esc(a.type)}</span>
-                            <span class="anomaly-count">${a.count}</span>
-                        </div>
-                        <p class="anomaly-desc">${esc(a.description)}</p>
-                    </div>`;
-    }).join('')}
-        </div>`;
+    zone.addEventListener('click', () => input.click());
+    zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('drag-over'); });
+    zone.addEventListener('dragleave', () => zone.classList.remove('drag-over'));
+    zone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        zone.classList.remove('drag-over');
+        if (e.dataTransfer.files.length) doAppendUpload(e.dataTransfer.files[0]);
+    });
+    input.addEventListener('change', () => { if (input.files.length) doAppendUpload(input.files[0]); });
 }
 
-// ── Timeline (Canvas Gantt) ──────────────────────────────────────
-function drawTimeline(entries) {
-    const canvas = $('timeline-canvas');
-    const emptyEl = $('timeline-empty');
+async function doAppendUpload(file) {
+    const fd = new FormData();
+    fd.append('file', file);
+    fd.append('job_id', jobId);
 
-    if (!entries || entries.length === 0) {
-        canvas.classList.add('hidden');
-        emptyEl.classList.remove('hidden');
-        return;
-    }
-    canvas.classList.remove('hidden');
-    emptyEl.classList.add('hidden');
-
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-
-    // Size canvas
-    const rect = canvas.parentElement.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = Math.max(400, entries.length * 28 + 80) * dpr;
-    canvas.style.width = rect.width + 'px';
-    canvas.style.height = Math.max(400, entries.length * 28 + 80) + 'px';
-    ctx.scale(dpr, dpr);
-
-    const W = rect.width;
-    const H = parseInt(canvas.style.height);
-    const LEFT = 140;
-    const TOP = 40;
-    const BAR_H = 18;
-    const ROW_H = 26;
-
-    // Compute time range
-    let minDate = Infinity, maxDate = -Infinity;
-    const parsed = entries.map(e => {
-        const s = new Date(e.start);
-        const end = e.end ? new Date(e.end) : new Date(s.getTime() + 365 * 86400000);
-        if (s.getTime() < minDate) minDate = s.getTime();
-        if (end.getTime() > maxDate) maxDate = end.getTime();
-        return { ...e, startTs: s.getTime(), endTs: end.getTime() };
-    });
-
-    const rangeMs = maxDate - minDate || 1;
-
-    // Background
-    ctx.fillStyle = '#0d0d1a';
-    ctx.fillRect(0, 0, W, H);
-
-    // Header
-    ctx.fillStyle = '#9898b0';
-    ctx.font = '11px Inter, sans-serif';
-    ctx.textAlign = 'center';
-
-    const yearStart = new Date(minDate).getFullYear();
-    const yearEnd = new Date(maxDate).getFullYear();
-    for (let y = yearStart; y <= yearEnd; y++) {
-        const ts = new Date(y, 0, 1).getTime();
-        const x = LEFT + ((ts - minDate) / rangeMs) * (W - LEFT - 20);
-        if (x >= LEFT && x <= W - 20) {
-            ctx.fillStyle = 'rgba(99,102,241,0.15)';
-            ctx.fillRect(x, TOP, 1, H - TOP);
-            ctx.fillStyle = '#9898b0';
-            ctx.fillText(y.toString(), x, TOP - 8);
+    try {
+        const resp = await fetch('/api/append/upload', { method: 'POST', body: fd });
+        if (!resp.ok) {
+            const err = await resp.json();
+            showError(err.detail || 'Append upload failed');
+            return;
         }
+
+        appendUploadData = await resp.json();
+        appendSelectedSheets = new Set();
+        appendUploadData.sheets.forEach((s) => appendSelectedSheets.add(s.sheet_name));
+
+        showAppendModal();
+    } catch (err) {
+        showError(`Upload failed: ${err.message}`);
     }
+}
 
-    // Color palette
-    const colors = ['#6366f1', '#8b5cf6', '#ec4899', '#f59e0b', '#22c55e', '#06b6d4', '#f97316'];
+function showAppendModal() {
+    const modal = $('append-modal');
+    modal.classList.remove('hidden');
 
-    // Group by vendor
-    const vendorMap = {};
-    parsed.forEach(e => {
-        if (!vendorMap[e.vendor]) vendorMap[e.vendor] = [];
-        vendorMap[e.vendor].push(e);
+    // Render sheet chips
+    const wrap = $('append-sheet-summary');
+    _rebuildSheetChips(wrap, appendUploadData.sheets, appendSelectedSheets, true);
+
+    // Build mapping table
+    buildAppendMappingTable();
+}
+
+function buildAppendMappingTable() {
+    const tbody = $('append-mapping-tbody');
+    const sheets = (appendUploadData?.sheets || []).filter((s) => appendSelectedSheets.has(s.sheet_name));
+
+    const sampleMap = {};
+    const colSet = new Set();
+    sheets.forEach((s) => {
+        s.columns.forEach((c) => {
+            colSet.add(c);
+            if (!sampleMap[c] && s.sample_values[c]) sampleMap[c] = s.sample_values[c];
+        });
     });
 
-    let row = 0;
-    const vendorNames = Object.keys(vendorMap).sort();
+    const allCols = [...colSet];
+    const existingCols = appendUploadData.existing_columns || [];
+    const targetOptions = ['account_id', 'close_date', ...existingCols.filter((c) => c !== 'account_id' && c !== 'close_date')];
 
-    vendorNames.forEach((vendor, vi) => {
-        const entries = vendorMap[vendor];
-        const color = colors[vi % colors.length];
-        const y = TOP + row * ROW_H;
+    // Also add new columns
+    allCols.forEach((c) => {
+        if (!targetOptions.includes(c)) targetOptions.push(c);
+    });
 
-        // Vendor label
-        ctx.fillStyle = '#e2e2f0';
-        ctx.font = '11px Inter, sans-serif';
-        ctx.textAlign = 'right';
-        ctx.fillText(trunc(vendor, 16), LEFT - 8, y + BAR_H / 2 + 4);
+    const optionsHtml = `<option value="">— skip —</option>` +
+        targetOptions.map((f) => {
+            const isKey = f === 'account_id' || f === 'close_date';
+            const isExisting = existingCols.includes(f);
+            const label = isKey ? f + ' ★' : isExisting ? f + ' (existing)' : f + ' (new)';
+            return `<option value="${esc(f)}">${esc(label)}</option>`;
+        }).join('');
 
-        // Bars
-        entries.forEach(e => {
-            const x1 = LEFT + ((e.startTs - minDate) / rangeMs) * (W - LEFT - 20);
-            const x2 = LEFT + ((e.endTs - minDate) / rangeMs) * (W - LEFT - 20);
-            const bw = Math.max(x2 - x1, 4);
+    let rows = '';
+    for (const rawCol of allCols) {
+        const samples = (sampleMap[rawCol] || []).slice(0, 6);
+        let samplesHtml = '<span class="muted">—</span>';
+        if (samples.length) {
+            samplesHtml = `<div class="samples-wrap">${samples.map((s) =>
+                `<span class="sample-pill">${esc(trunc(String(s), 36))}</span>`
+            ).join('')}</div>`;
+        }
 
-            ctx.fillStyle = color;
-            ctx.globalAlpha = 0.8;
-            roundRect(ctx, x1, y, bw, BAR_H, 3);
-            ctx.fill();
-            ctx.globalAlpha = 1;
+        rows += `<tr>
+            <td class="col-name">${esc(rawCol)}</td>
+            <td>${samplesHtml}</td>
+            <td><select class="mapping-select append-mapping-select" data-raw="${esc(rawCol)}">${optionsHtml}</select></td>
+        </tr>`;
+    }
 
-            // Label inside bar if wide enough
-            if (bw > 50) {
-                ctx.fillStyle = '#fff';
-                ctx.font = '9px Inter, sans-serif';
-                ctx.textAlign = 'left';
-                const label = e.product || e.id || '';
-                ctx.fillText(trunc(label, Math.floor(bw / 6)), x1 + 6, y + 13);
-            }
+    tbody.innerHTML = rows;
+
+    // Auto-detect mappings
+    document.querySelectorAll('.append-mapping-select').forEach((sel) => {
+        const raw = sel.dataset.raw.toLowerCase().trim();
+        if (raw.includes('account') && raw.includes('id') || raw === 'accountid' || raw === 'account_id') {
+            sel.value = 'account_id';
+        } else if (raw.includes('close') && raw.includes('date') || raw === 'closedate' || raw === 'close_date') {
+            sel.value = 'close_date';
+        } else {
+            // Try exact match
+            const match = targetOptions.find((t) => t === sel.dataset.raw);
+            if (match) sel.value = match;
+        }
+    });
+}
+
+async function doAppendConfirm() {
+    const mappings = {};
+    document.querySelectorAll('.append-mapping-select').forEach((sel) => {
+        mappings[sel.dataset.raw] = sel.value || null;
+    });
+
+    // Check required key columns
+    const mapped = new Set(Object.values(mappings).filter(Boolean));
+    if (!mapped.has('account_id') || !mapped.has('close_date')) {
+        showError('Please map columns to account_id and close_date before appending.');
+        return;
+    }
+
+    hideAppendModal();
+
+    showSection('s-loading');
+    const status = $('loading-status');
+    const bar = $('loading-progress');
+    status.textContent = 'Appending data…';
+    bar.style.width = '30%';
+    bar.style.background = '';
+
+    try {
+        bar.style.width = '60%';
+        const resp = await fetch('/api/append/confirm', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                job_id: jobId,
+                selected_sheets: [...appendSelectedSheets],
+                mappings: mappings,
+            }),
         });
 
-        row += entries.length;
+        bar.style.width = '90%';
+
+        if (!resp.ok) {
+            const err = await resp.json();
+            showSection('s-master');
+            if (resp.status === 409) {
+                showError(err.detail);
+            } else {
+                showError(err.detail || 'Append failed');
+            }
+            return;
+        }
+
+        masterData = await resp.json();
+        bar.style.width = '100%';
+
+        setTimeout(() => {
+            showSection('s-master');
+            renderMaster();
+        }, 400);
+    } catch (err) {
+        showSection('s-master');
+        showError(`Append failed: ${err.message}`);
+    }
+}
+
+function hideAppendModal() {
+    $('append-modal').classList.add('hidden');
+    appendUploadData = null;
+    const input = $('append-input');
+    if (input) input.value = '';
+}
+
+// ── Error Modal ─────────────────────────────────────────────────
+function showError(message) {
+    $('error-detail').textContent = message;
+    $('error-modal').classList.remove('hidden');
+}
+
+function hideError() {
+    $('error-modal').classList.add('hidden');
+}
+
+// ── Tabs ────────────────────────────────────────────────────────
+function initTabs() {
+    document.addEventListener('click', (e) => {
+        if (e.target.classList.contains('tab')) {
+            const tab = e.target.dataset.tab;
+            document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('active', t.dataset.tab === tab));
+            document.querySelectorAll('.panel').forEach((p) => {
+                p.classList.toggle('active', p.id === `p-${tab}`);
+            });
+        }
     });
 }
 
-function roundRect(ctx, x, y, w, h, r) {
-    ctx.beginPath();
-    ctx.moveTo(x + r, y);
-    ctx.lineTo(x + w - r, y);
-    ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-    ctx.lineTo(x + w, y + h - r);
-    ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-    ctx.lineTo(x + r, y + h);
-    ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-    ctx.lineTo(x, y + r);
-    ctx.quadraticCurveTo(x, y, x + r, y);
-    ctx.closePath();
+// ── Reset ───────────────────────────────────────────────────────
+function resetAll() {
+    uploadData = null;
+    masterData = null;
+    appendUploadData = null;
+    selectedSheets = new Set();
+    appendSelectedSheets = new Set();
+    jobId = null;
+    setStep(1);
+    showSection('s-upload');
+    const input = $('file-input');
+    if (input) input.value = '';
 }
 
-// ── Vendor Clusters ──────────────────────────────────────────────
-function renderClusters(clusters, audit) {
-    const container = $('vendor-clusters');
-    if (clusters && clusters.length > 0) {
-        container.innerHTML = clusters.map(cl => {
-            const variants = cl.variants.filter(v => v !== cl.canonical);
-            return `
-                <div class="cluster-chip">
-                    <span class="canonical">${esc(cl.canonical)}</span>
-                    <span class="variant-arrow">←</span>
-                    <span class="variants">${variants.map(esc).join(', ')}</span>
-                </div>`;
-        }).join('');
-    } else {
-        container.innerHTML = '<div class="empty-state"><p>No vendor clusters detected.</p></div>';
-    }
+// ── Init ────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    initUpload();
+    initAppend();
+    initTabs();
 
-    if (audit.unmapped_columns && audit.unmapped_columns.length > 0) {
-        unmappedWrapper.classList.remove('hidden');
-        unmappedList.innerHTML = audit.unmapped_columns.map(c =>
-            `<span class="tag">${esc(c)}</span>`
-        ).join('');
-    } else {
-        unmappedWrapper.classList.add('hidden');
-    }
-}
+    $('merge-btn').addEventListener('click', doMerge);
+    $('reset-mappings-btn').addEventListener('click', () => {
+        document.querySelectorAll('#mapping-tbody .mapping-select').forEach((s) => { s.value = ''; });
+        updateMappingCounts();
+    });
+    $('reset-btn').addEventListener('click', resetAll);
 
-// ── Helpers ──────────────────────────────────────────────────────
-function setAnalyzeStatus(t) { analyzeStatus.textContent = t; }
-function setAnalyzeProgress(p) { analyzeProgress.style.width = p + '%'; }
-function setStatus(t) { processStatus.textContent = t; }
-function setProgress(p) { progressFill.style.width = p + '%'; }
-function trunc(s, n) { return s.length > n ? s.slice(0, n) + '…' : s; }
-function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+    // Append modal
+    $('append-modal-close').addEventListener('click', hideAppendModal);
+    $('append-cancel-btn').addEventListener('click', hideAppendModal);
+    $('append-confirm-btn').addEventListener('click', doAppendConfirm);
 
-// ── Download ─────────────────────────────────────────────────────
-downloadXlsxBtn.addEventListener('click', () => {
-    if (!currentResult) return;
-    const a = document.createElement('a');
-    a.href = `/api/download/${currentResult.job_id}/${currentResult.xlsx_filename}`;
-    a.download = currentResult.xlsx_filename;
-    a.click();
-});
-downloadCsvBtn.addEventListener('click', () => {
-    if (!currentResult) return;
-    const a = document.createElement('a');
-    a.href = `/api/download/${currentResult.job_id}/${currentResult.csv_filename}`;
-    a.download = currentResult.csv_filename;
-    a.click();
-});
-
-// ── Reset ────────────────────────────────────────────────────────
-resetBtn.addEventListener('click', () => {
-    currentResult = null;
-    analyzeData = null;
-    originalMappings = null;
-    fileInput.value = '';
-    progressFill.style.width = '0%';
-    analyzeProgress.style.width = '0%';
-    showSection('upload');
-    loadTemplates();
+    // Error modal
+    $('error-modal-close').addEventListener('click', hideError);
+    $('error-ok-btn').addEventListener('click', hideError);
 });

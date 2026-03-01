@@ -1,0 +1,126 @@
+{
+    "version": "v1",
+    "description": "Aggregation rules for rolling up line-item rows into contract-level records.",
+    "group_by": [
+        "contract_id"
+    ],
+    "rules": {
+        "total_value": {
+            "method": "sum",
+            "description": "Sum all line-item values"
+        },
+        "acv": {
+            "method": "sum",
+            "description": "Sum ACV across line items"
+        },
+        "net_arr": {
+            "method": "sum",
+            "description": "Sum net ARR"
+        },
+        "quote_arr": {
+            "method": "sum",
+            "description": "Sum quote ARR"
+        },
+        "expiring_arr": {
+            "method": "sum",
+            "description": "Sum expiring ARR"
+        },
+        "growth_arr": {
+            "method": "sum",
+            "description": "Sum growth ARR"
+        },
+        "customer_amount": {
+            "method": "sum",
+            "description": "Sum customer amounts"
+        },
+        "unit_price": {
+            "method": "sum",
+            "description": "Sum unit prices"
+        },
+        "discount": {
+            "method": "mean",
+            "description": "Average discount across items"
+        },
+        "quantity": {
+            "method": "sum",
+            "description": "Sum quantities"
+        },
+        "start_date": {
+            "method": "min",
+            "description": "Earliest start date"
+        },
+        "end_date": {
+            "method": "max",
+            "description": "Latest end date"
+        },
+        "close_date": {
+            "method": "first",
+            "description": "First non-null close date"
+        },
+        "renewal_date": {
+            "method": "max",
+            "description": "Latest renewal date"
+        },
+        "vendor": {
+            "method": "first",
+            "description": "First non-null vendor"
+        },
+        "account_id": {
+            "method": "first",
+            "description": "First non-null account ID"
+        },
+        "product": {
+            "method": "collect_unique",
+            "description": "Collect unique product names"
+        },
+        "department": {
+            "method": "first",
+            "description": "First non-null department"
+        },
+        "owner": {
+            "method": "first",
+            "description": "First non-null owner"
+        },
+        "status": {
+            "method": "first",
+            "description": "First non-null status"
+        },
+        "category": {
+            "method": "first",
+            "description": "First non-null category"
+        },
+        "notes": {
+            "method": "collect_unique",
+            "description": "Collect unique notes"
+        },
+        "auto_renew": {
+            "method": "first",
+            "description": "First non-null auto_renew flag"
+        },
+        "term_months": {
+            "method": "max",
+            "description": "Max term in months"
+        },
+        "currency": {
+            "method": "first",
+            "description": "First non-null currency"
+        },
+        "close_year": {
+            "method": "first",
+            "description": "First non-null close year"
+        },
+        "fiscal_period": {
+            "method": "first",
+            "description": "First non-null fiscal period"
+        },
+        "account_segment": {
+            "method": "first",
+            "description": "First non-null segment"
+        },
+        "opportunity_type": {
+            "method": "first",
+            "description": "First non-null opp type"
+        }
+    },
+    "line_item_count_field": "line_item_count"
+}

@@ -1,1 +1,1 @@
-# DataOrgModel — SaaS Contract Data Organizer
+# Contract Data Merger — Core modules

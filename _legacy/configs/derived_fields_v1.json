@@ -1,0 +1,41 @@
+{
+    "version": "v1",
+    "description": "Rules for computing derived fields from canonical data.",
+    "fields": {
+        "contract_duration_days": {
+            "operation": "date_diff_days",
+            "start": "start_date",
+            "end": "end_date",
+            "description": "Number of days between start and end date"
+        },
+        "duration_years": {
+            "operation": "divide",
+            "numerator": "contract_duration_days",
+            "denominator": 365.25,
+            "description": "Contract duration in years"
+        },
+        "annualized_value": {
+            "operation": "safe_divide",
+            "numerator": "total_value",
+            "denominator": "duration_years",
+            "description": "Total value annualized over contract duration"
+        },
+        "monthly_value": {
+            "operation": "safe_divide",
+            "numerator": "total_value",
+            "denominator": "term_months",
+            "fallback": null,
+            "description": "Total value divided by term months"
+        },
+        "churn_flag": {
+            "operation": "boolean_expression",
+            "expression": "end_date < today AND auto_renew != true",
+            "description": "True if contract has ended and is not auto-renewing"
+        },
+        "renewal_flag": {
+            "operation": "boolean_expression",
+            "expression": "auto_renew == true OR renewal_date IS NOT NULL",
+            "description": "True if contract is set to renew"
+        }
+    }
+}

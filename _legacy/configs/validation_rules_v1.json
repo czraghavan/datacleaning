@@ -1,0 +1,92 @@
+{
+    "version": "v1",
+    "description": "Validation and integrity rules enforced before ML consumption.",
+    "structural": {
+        "required_fields_present": {
+            "enabled": true,
+            "severity": "error",
+            "description": "All required canonical fields must be present as columns"
+        },
+        "no_nulls_in_required": {
+            "enabled": true,
+            "severity": "error",
+            "fields": [
+                "contract_id",
+                "total_value",
+                "start_date",
+                "end_date"
+            ],
+            "description": "Required fields must not contain null values"
+        },
+        "no_duplicate_contract_id": {
+            "enabled": true,
+            "severity": "error",
+            "description": "contract_id must be unique after aggregation"
+        },
+        "no_invalid_numeric": {
+            "enabled": true,
+            "severity": "warning",
+            "description": "Numeric fields must contain valid numbers"
+        }
+    },
+    "logical": {
+        "end_gte_start": {
+            "enabled": true,
+            "severity": "error",
+            "start_field": "start_date",
+            "end_field": "end_date",
+            "description": "end_date must be >= start_date"
+        },
+        "aggregation_totals_match": {
+            "enabled": true,
+            "severity": "warning",
+            "description": "Aggregated totals must equal sum of source line items"
+        },
+        "no_zero_duration": {
+            "enabled": true,
+            "severity": "warning",
+            "allow_zero": false,
+            "description": "Contract duration must be > 0 unless explicitly allowed"
+        },
+        "no_negative_financials": {
+            "enabled": true,
+            "severity": "warning",
+            "fields": [
+                "total_value",
+                "acv",
+                "net_arr",
+                "unit_price"
+            ],
+            "description": "Financial values should not be negative"
+        }
+    },
+    "statistical": {
+        "outlier_detection": {
+            "enabled": true,
+            "severity": "warning",
+            "std_threshold": 3.0,
+            "fields": [
+                "total_value",
+                "acv",
+                "net_arr"
+            ],
+            "min_sample_size": 10,
+            "description": "Flag values exceeding N standard deviations from mean"
+        },
+        "extreme_duration": {
+            "enabled": true,
+            "severity": "warning",
+            "max_months": 120,
+            "description": "Flag contracts with duration > 10 years"
+        },
+        "future_date_detection": {
+            "enabled": true,
+            "severity": "info",
+            "max_years_ahead": 1,
+            "fields": [
+                "close_date"
+            ],
+            "description": "Flag dates more than N years in the future"
+        }
+    }
+}
